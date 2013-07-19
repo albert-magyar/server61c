@@ -6,10 +6,11 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <time.h>
+#include <curses.h>
 
-#define SERVER_PORT 10999
 #define SERVER_BACKLOG 64
 #define FRAG_LENGTH 64
+#define CHUNK_SIZE 256
 
 char * const resp_ok_format_string =
   "HTTP/1.1 %d %s\r\nDate: %s\r\nServer: server61c\r\nContent-Length: %d\r\nConnection: close\r\nContent-Type: text/html; charset=iso-8859-1\r\n\r\n%s";
@@ -33,12 +34,17 @@ typedef struct conn {
   struct sockaddr_in addr;
 } conn_t;
 
-int init_server(server_t *s) {
+void error(char *msg) {
+  printf("ERROR: %s\n", msg);
+  exit(-1);
+}
+
+int init_server(server_t *s, uint16_t port) {
   int retval = 0;
   memset(s, 0, sizeof(server_t));
   s->sock = socket(AF_INET, SOCK_STREAM, 0);
   s->addr.sin_family = AF_INET;
-  s->addr.sin_port = htons(SERVER_PORT);
+  s->addr.sin_port = htons(port);
   s->addr.sin_addr.s_addr = INADDR_ANY;
   if (bind(s->sock, (struct sockaddr *) &s->addr, sizeof(struct sockaddr_in))) retval |= 1;
   if (listen(s->sock, SERVER_BACKLOG)) retval |= 2;
@@ -94,10 +100,18 @@ ssize_t craft_http_response(int fd, char **resp) {
   info.date = ctime(&date);
   info.date[strlen(info.date)-1] = '\0';
   if (fd >= 0) {
+    int current_length = 0;
+    ssize_t bytes_read = 0;
     info.code = 200;
     info.explanation = "OK";
-    info.content = malloc(strlen(found_page)+1);
-    strcpy(info.content,found_page);
+    info.content = NULL;
+    do {
+      info.content = realloc(info.content,current_length+CHUNK_SIZE);
+      if (!info.content) exit(-1);
+      bytes_read = pread(fd, (void *) info.content+current_length, CHUNK_SIZE, current_length);
+      current_length += bytes_read;
+    } while (bytes_read > 0);
+    info.content[current_length] = '\0';
   } else {
     info.code = 404;
     info.explanation = "Not Found";
@@ -113,7 +127,6 @@ void serve_request(conn_t *c, char *req) {
   int fd = get_resource_fd(c, req);
   char *resp = NULL;
   size_t resp_length = craft_http_response(fd, &resp);
-  printf("Response:\n\n%s\n\nLength:\n\n%d\n\n",resp,(int)resp_length);
   ssize_t bytes_sent = send(c->sock, (void *) resp, resp_length, 0);
   close(fd);
   free(resp);
@@ -126,7 +139,6 @@ void handle_conn(server_t *s) {
   c.sock = accept(s->sock, (struct sockaddr *) &c.addr, &addr_size);
   request = get_request(&c);
   if (request) {
-    printf("%s\n", request);
     serve_request(&c, request);
     free(request);
   }
@@ -135,8 +147,33 @@ void handle_conn(server_t *s) {
 
 int main(int argc, char **argv) {
   server_t s;
+  char input = '\0';
   int err_code;
-  if (err_code = init_server(&s)) printf("Error code: %d\n", err_code);
-  handle_conn(&s);
+  fd_set read_fs;
+  int max_sock;
+  uint16_t port;
+  struct timeval timeout;
+  if (argc != 2) error("usage is \"server61c <port>\"");
+  int tmp = atoi(argv[1]);
+  if (tmp > 65535) error("specified port unavailable");
+  port = (uint16_t) tmp;
+  err_code = init_server(&s, port);
+  if (err_code & 0x1) error("could not bind socket");
+  if (err_code & 0x2) error("could not listen()");
+  printf("server61c starting...\npress q <Enter> to quit\n");
+  while (input != 'q') {
+    FD_ZERO(&read_fs);
+    FD_SET(STDIN_FILENO, &read_fs);
+    FD_SET(s.sock, &read_fs);
+    max_sock = (s.sock > STDIN_FILENO) ? s.sock+1 : STDIN_FILENO+1;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    select(max_sock, &read_fs, NULL, NULL, &timeout);
+    if (FD_ISSET(STDIN_FILENO, &read_fs)) {
+      read(0, (void *) &input, 1);
+    } else if (FD_ISSET(s.sock, &read_fs)) {
+      handle_conn(&s);
+    }
+  }
   return 0;
 }
